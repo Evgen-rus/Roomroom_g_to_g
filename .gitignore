@@ -5,6 +5,7 @@ credentials/
 
 # Logs
 *.log
+logs/
 service_log.txt
 bot_process.log
 
