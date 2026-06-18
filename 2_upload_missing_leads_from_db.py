@@ -7,7 +7,7 @@ import random
 import re
 import sqlite3
 import time
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from dotenv import load_dotenv
 from google.oauth2 import service_account
@@ -16,9 +16,10 @@ from googleapiclient.errors import HttpError
 
 
 DB_PATH = "lr186.db"
-STATUS_COLUMN_NAME = "статус отправки в таблицу клиента"
 STATUS_VALUE = "sent_bot"
 ADD_ROWS_COUNT = 500
+SOURCE_STATUS_COLUMN_LETTER = "F"
+CLIENT_STATUS_DROPDOWN_COLUMN_INDEX = 6
 
 # Нужен полный доступ к таблицам, потому что скрипт записывает данные.
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -80,22 +81,6 @@ def validate_spreadsheet_id(spreadsheet_id: str, env_name: str) -> str:
 def quote_sheet_name(sheet_name: str) -> str:
     escaped_name = sheet_name.replace("'", "''")
     return f"'{escaped_name}'"
-
-
-def normalize_header(header: str) -> str:
-    return re.sub(r"\s+", " ", header.strip().lower())
-
-
-def column_index_to_letter(index: int) -> str:
-    """Переводит номер столбца 1 -> A, 2 -> B, 27 -> AA."""
-    if index < 1:
-        raise ValueError("Номер столбца должен быть больше 0")
-
-    letters = ""
-    while index:
-        index, remainder = divmod(index - 1, 26)
-        letters = chr(65 + remainder) + letters
-    return letters
 
 
 def create_sheets_service(credentials_file: str):
@@ -265,6 +250,56 @@ def write_leads_to_client_sheet(
     return updated_rows
 
 
+def copy_client_status_dropdown(
+    service,
+    spreadsheet_id: str,
+    sheet_id: int,
+    start_row: int,
+    end_row: int,
+) -> int:
+    """Копирует пустой dropdown в колонке F из предыдущей строки в новые строки."""
+    source_row = start_row - 1
+    if source_row < 1:
+        logger.warning(
+            "Не удалось скопировать dropdown: перед строкой %s нет строки-шаблона.",
+            start_row,
+        )
+        return 0
+
+    column_start_index = CLIENT_STATUS_DROPDOWN_COLUMN_INDEX - 1
+    execute_with_retries(
+        lambda: service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "copyPaste": {
+                            "source": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": source_row - 1,
+                                "endRowIndex": source_row,
+                                "startColumnIndex": column_start_index,
+                                "endColumnIndex": CLIENT_STATUS_DROPDOWN_COLUMN_INDEX,
+                            },
+                            "destination": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": start_row - 1,
+                                "endRowIndex": end_row,
+                                "startColumnIndex": column_start_index,
+                                "endColumnIndex": CLIENT_STATUS_DROPDOWN_COLUMN_INDEX,
+                            },
+                            "pasteType": "PASTE_DATA_VALIDATION",
+                            "pasteOrientation": "NORMAL",
+                        }
+                    }
+                ]
+            },
+        ),
+        "copy_client_status_dropdown",
+    )
+    return end_row - start_row + 1
+
+
 def mark_leads_sent_in_db(conn: sqlite3.Connection, leads: List[LeadRow]) -> int:
     if not leads:
         return 0
@@ -282,36 +317,12 @@ def mark_leads_sent_in_db(conn: sqlite3.Connection, leads: List[LeadRow]) -> int
     return conn.total_changes - before
 
 
-def read_source_headers(service, spreadsheet_id: str, sheet_name: str) -> List[str]:
-    result = execute_with_retries(
-        lambda: service.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=spreadsheet_id,
-            range=f"{quote_sheet_name(sheet_name)}!1:1",
-        ),
-        "read_source_headers",
-    )
-    rows = result.get("values", [])
-    return rows[0] if rows else []
-
-
-def find_status_column(headers: List[str]) -> int:
-    for index, header in enumerate(headers, start=1):
-        if normalize_header(header) == STATUS_COLUMN_NAME:
-            return index
-    raise ValueError(f"Не найден столбец: {STATUS_COLUMN_NAME}")
-
-
 def mark_leads_sent_in_source_sheet(
     service,
     spreadsheet_id: str,
     sheet_name: str,
     leads: List[LeadRow],
 ) -> int:
-    headers = read_source_headers(service, spreadsheet_id, sheet_name)
-    status_column = column_index_to_letter(find_status_column(headers))
-
     update_data = []
     skipped_without_row = 0
     for lead in leads:
@@ -322,7 +333,7 @@ def mark_leads_sent_in_source_sheet(
             {
                 "range": (
                     f"{quote_sheet_name(sheet_name)}!"
-                    f"{status_column}{lead.sheet_row}"
+                    f"{SOURCE_STATUS_COLUMN_LETTER}{lead.sheet_row}"
                 ),
                 "values": [[STATUS_VALUE]],
             }
@@ -411,6 +422,21 @@ def main() -> None:
             end_row,
             written_rows,
         )
+
+        try:
+            copied_dropdowns = copy_client_status_dropdown(
+                service,
+                client_spreadsheet_id,
+                client_sheet_id,
+                start_row,
+                end_row,
+            )
+            logger.info("Dropdown в колонке F скопирован в строк: %s", copied_dropdowns)
+        except Exception:
+            logger.exception(
+                "Лиды уже записаны клиенту, но не удалось скопировать "
+                "dropdown в колонке F."
+            )
 
         marked_in_db = mark_leads_sent_in_db(conn, leads)
         logger.info("Отмечено в локальной БД: %s", marked_in_db)
